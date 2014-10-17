@@ -217,21 +217,46 @@ module Padrino
         # Data is options, and options is locals in this case
         data, options, locals = nil, data, options if data.is_a?(Hash)
 
+        options = options.dup
+
         # If data is unassigned then this is a likely a template to be resolved
         # This means that no engine was explicitly defined
         data, engine = resolve_template(engine, options) if data.nil?
 
         options[:layout] ||= false unless Rendering.engine_configurations.has_key?(engine)
 
-        # Cleanup the template.
-        @current_engine, engine_was = engine, @current_engine
-        @_out_buf,  buf_was = ActiveSupport::SafeBuffer.new, @_out_buf
+        locals         = options.delete(:locals) || locals || {}
+        scope          = options.delete(:scope) || self
+        content_type   = options.delete(:content_type) || options.delete(:default_content_type)
+        views          = options.delete(:views) || settings.views || "./views"
+        layout         = options.delete(:layout)
+        layout_options = options.delete(:layout_options) || {}
 
-        # Pass arguments to Sinatra render method.
-        super(engine, data, with_layout(options), locals, &block)
-      ensure
-        @current_engine = engine_was
-        @_out_buf = buf_was
+        engine_options = Rendering.engine_configurations[engine] || {}
+        template = compile_template(engine, data, engine_options.merge(options), views)
+
+        begin
+          engine_was = @current_engine
+          @current_engine = engine
+          buf_was = @_out_buf
+          @_out_buf = ActiveSupport::SafeBuffer.new
+
+          output = template.render(scope, locals, &block)
+        ensure
+          @current_engine = engine_was
+          @_out_buf = buf_was
+        end
+
+        layout, layout_engine = resolve_layout(layout, views) unless layout == false
+        if layout
+          options = options.merge(:views => views, :layout => false, :eat_errors => false, :scope => scope).merge!(layout_options)
+          catch(:layout_missing) do
+            return render(layout_engine || engine, layout, options, locals) { output }
+          end
+        end
+
+        output.extend(Sinatra::Base::ContentTyped).content_type = content_type if content_type
+        output
       end
 
       ##
@@ -300,35 +325,32 @@ module Padrino
         I18n.locale if defined?(I18n)
       end
 
-      def resolve_layout(layout, options={})
-        layouts_path = options[:layout_options] && options[:layout_options][:views] || options[:views] || settings.views || "./views"
+      def resolve_layout(layout, layouts_path)
+        if settings.templates.has_key?(:layout) && @layout.nil?
+          return layout == true ? @default_layout : false
+        end
+
+        layout = @layout if layout == true || layout.nil?
+
+        if layout.kind_of?(String) && Pathname.new(layout).absolute?
+          layout = layout.rpartition('/').last
+        end
+
         template_path = settings.fetch_layout_path(layout, layouts_path)
         rendering_options = [template_path, content_type || :html, locale]
 
-        settings.cache_template_path(rendering_options) do
+        layout, layout_engine = settings.cache_template_path(rendering_options) do
           template_candidates = glob_templates(layouts_path, template_path)
           selected_template = select_template(template_candidates, *rendering_options)
 
           fail TemplateNotFound, "Layout '#{template_path}' not found in '#{layouts_path}'" if !selected_template && layout.present?
           selected_template
         end
-      end
 
-      def with_layout(options)
-        options = options.dup
-        layout = options[:layout]
-        return options if layout == false
+        layout = false if layout.nil?
+        layout = @default_layout if layout == true
 
-        layout = @layout if !layout || layout == true
-        return options if settings.templates.has_key?(:layout) && layout.blank?
-
-        if layout.kind_of?(String) && Pathname.new(layout).absolute?
-          layout_path, _, layout = layout.rpartition('/')
-          options[:layout_options] ||= {}
-          options[:layout_options][:views] ||= layout_path
-        end
-        layout, layout_engine = resolve_layout(layout, options)
-        options.update(:layout => layout, :layout_engine => layout_engine)
+        [layout, layout_engine]
       end
 
       def glob_templates(views_path, template_path)
